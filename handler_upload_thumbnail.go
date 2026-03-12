@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -64,14 +65,17 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	tn := thumbnail{
-		data:      imageData,
-		mediaType: mediaType,
-	}
-	videoThumbnails[videoID] = tn
+	// tn := thumbnail{
+	// 	data:      imageData,
+	// 	mediaType: mediaType,
+	// }
+	// videoThumbnails[videoID] = tn
 
-	thumbnailURL := fmt.Sprintf("http://localhost:8091/api/thumbnails/%s", videoID)
-	video.ThumbnailURL = &thumbnailURL
+	// thumbnailURL := fmt.Sprintf("http://localhost:8091/api/thumbnails/%s", videoID)
+	// video.ThumbnailURL = &thumbnailURL
+	str := base64.StdEncoding.EncodeToString(imageData)
+	data := fmt.Sprintf("data:%s;base64,%s", mediaType, str)
+	video.ThumbnailURL = &data
 
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
