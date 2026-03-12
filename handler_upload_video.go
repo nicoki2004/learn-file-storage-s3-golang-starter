@@ -19,10 +19,10 @@ import (
 )
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
-	// 1. Set upload limit to 1 GB
+	// 1. Límite de subida de 1 GB
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
 
-	// 2. Extract videoID from URL and parse as UUID
+	// 2. Extraer videoID de los parámetros de la ruta
 	videoIDString := r.PathValue("videoID")
 	videoID, err := uuid.Parse(videoIDString)
 	if err != nil {
@@ -30,7 +30,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 3. Authenticate user
+	// 3. Autenticación del usuario
 	token, err := auth.GetBearerToken(r.Header)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, "Couldn't find JWT", err)
@@ -43,7 +43,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 4. Get metadata and check ownership
+	// 4. Obtener metadatos y verificar propiedad
 	video, err := cfg.db.GetVideo(videoID)
 	if err != nil {
 		respondWithError(w, http.StatusNotFound, "Video not found", err)
@@ -54,7 +54,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 5. Parse uploaded file from form data
+	// 5. Parsear el archivo del formulario
 	file, header, err := r.FormFile("video")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Unable to parse video file", err)
@@ -62,14 +62,14 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	defer file.Close()
 
-	// 6. Validate MIME type
+	// 6. Validar tipo MIME (solo MP4)
 	mediaType, _, err := mime.ParseMediaType(header.Header.Get("Content-Type"))
 	if err != nil || mediaType != "video/mp4" {
 		respondWithError(w, http.StatusBadRequest, "Invalid file type. Only MP4 is allowed", err)
 		return
 	}
 
-	// 7. Save to temporary file
+	// 7. Guardar en archivo temporal inicial
 	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not create temp file", err)
@@ -83,21 +83,30 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 8. Reset file pointer for S3 upload
-	_, err = tempFile.Seek(0, io.SeekStart)
+	// 8. Pre-procesar para Fast Start
+	processedPath, err := processVideoForFastStart(tempFile.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Could not reset file pointer", err)
+		respondWithError(w, http.StatusInternalServerError, "Could not process video for fast start", err)
 		return
 	}
+	defer os.Remove(processedPath)
 
-	ratio, err := getVideoAspectRatio(tempFile.Name())
+	// 9. Determinar Aspect Ratio del video procesado
+	ratio, err := getVideoAspectRatio(processedPath)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error determining video aspect ratio", err)
 		return
 	}
 
-	// 9. Put object into S3
-	// Generate random 32-byte hex key
+	// 10. Abrir el archivo procesado para subirlo a S3
+	processedFile, err := os.Open(processedPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not open processed file", err)
+		return
+	}
+	defer processedFile.Close()
+
+	// 11. Generar Key para S3 (prefijo/random.mp4)
 	randomBytes := make([]byte, 32)
 	_, err = rand.Read(randomBytes)
 	if err != nil {
@@ -107,10 +116,11 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	fileName := fmt.Sprintf("%x.mp4", randomBytes)
 	fileKey := fmt.Sprintf("%s/%s", ratio, fileName)
 
+	// 12. Subir a S3
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(fileKey),
-		Body:        tempFile,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -118,8 +128,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 10. Update database with S3 URL
-	// Format: https://<bucket>.s3.<region>.amazonaws.com/<key>
+	// 13. Actualizar base de datos con URL de S3
 	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileKey)
 	video.VideoURL = &videoURL
 
@@ -131,6 +140,8 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	respondWithJSON(w, http.StatusOK, video)
 }
+
+// --- Funciones de Utilidad ---
 
 func getVideoAspectRatio(filePath string) (string, error) {
 	cmd := exec.Command("ffprobe",
@@ -145,6 +156,7 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	var probeData FFProbeResponse
 	if err := json.Unmarshal(out.Bytes(), &probeData); err != nil {
 		return "", err
@@ -162,25 +174,25 @@ func getVideoAspectRatio(filePath string) (string, error) {
 		return "other", nil
 	}
 
-	return "", nil
+	return "", fmt.Errorf("no streams found")
 }
 
 func processVideoForFastStart(filePath string) (string, error) {
-	outputKey := filePath + ".processing"
+	outputPath := filePath + ".processing"
 
 	cmd := exec.Command("ffmpeg",
 		"-i", filePath,
 		"-c", "copy",
 		"-movflags", "faststart",
 		"-f", "mp4",
-		outputKey,
+		outputPath,
 	)
 
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("ffmpeg error: %v", err)
 	}
 
-	return outputKey, nil
+	return outputPath, nil
 }
 
 type FFProbeResponse struct {
