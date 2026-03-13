@@ -132,24 +132,26 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 13. Guardar como string delimitado por coma: "bucket,key"
-	dbVideoURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, fileKey)
-	video.VideoURL = &dbVideoURL
+	if cfg.s3CfDistribution == "" {
+		respondWithError(w, http.StatusInternalServerError, "CloudFront distribution domain not set", nil)
+		return
+	}
 
+	// Limpiamos el dominio de posibles barras finales y concatenamos la Key
+	cfBaseURL := strings.TrimSuffix(cfg.s3CfDistribution, "/")
+	videoURL := fmt.Sprintf("%s/%s", cfBaseURL, fileKey)
+
+	video.VideoURL = &videoURL
+
+	// 14. Actualizar la base de datos
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not update video in database", err)
 		return
 	}
 
-	// 14. Convertir a video firmado para la respuesta JSON
-	signedVideo, err := cfg.dbVideoToSignedVideo(video)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Could not generate presigned URL", err)
-		return
-	}
-
-	respondWithJSON(w, http.StatusOK, signedVideo)
+	// 15. Responder con el video (ya contiene la URL de CloudFront)
+	respondWithJSON(w, http.StatusCreated, video)
 }
 
 // --- Funciones de Utilidad ---
